@@ -102,8 +102,10 @@ jobs:
         # green. build.sh keeps its arch-aware paths (ABIARCH, BOOTAA64.EFI,
         # UEFI-only mkimg) so re-enabling is just restoring the matrix leg.
         include:
+          # arm64-image-build branch: build ONLY the aarch64 image so it can be
+          # boot-debugged locally (qemu-system-aarch64 + HVF on Apple Silicon).
           - freebsd: '15.1'
-            arch: 'amd64'
+            arch: 'arm64'
     steps:
       - uses: actions/checkout@v4
 
@@ -200,7 +202,7 @@ jobs:
     # passed this exact boot test on its merge ref — re-running it only re-exposes
     # the flaky qemu-serial loader handshake. We still boot-test on pull_request
     # (the gate) and on repository_dispatch (the base-updated cascade has no PR).
-    if: "!cancelled() && needs.changes.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') && github.event_name != 'push'"
+    if: false  # amd64-only harness; disabled on the arm64-image-build branch
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -270,7 +272,7 @@ jobs:
     # NON-GATING: not in release's `needs`, so a flaky live boot never blocks
     # publishing; it exists as the iteration feedback loop + a regression signal.
     # Skipped on push-to-main (same flaky-serial rationale as the disk `img-test`).
-    if: "!cancelled() && needs.build.result == 'success' && needs.changes.outputs.build_needed == 'true' && github.event_name != 'push'"
+    if: false  # amd64-only harness; disabled on the arm64-image-build branch
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
