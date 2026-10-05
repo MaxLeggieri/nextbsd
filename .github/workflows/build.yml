@@ -105,7 +105,7 @@ jobs:
           # arm64-image-build branch: build ONLY the aarch64 image so it can be
           # boot-debugged locally (qemu-system-aarch64 + HVF on Apple Silicon).
           - freebsd: '15.1'
-            arch: 'arm64'
+            arch: 'amd64'
     steps:
       - uses: actions/checkout@v4
 
