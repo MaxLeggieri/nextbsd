@@ -39,8 +39,9 @@ entirely differently than those original solutions.
 ## Try it in 5 minutes
 
 1. Grab the latest [continuous release][release]. Download
-   `NextBSD-amd64-<STAMP>.img.zip` (the raw disk image; there's also an
-   `.iso.zip`).
+   `NextBSD-<ARCH>-<STAMP>.img.zip` (the raw disk image; there's also an
+   `.iso.zip`). `<ARCH>` is `amd64` (x86-64) or `arm64` (AArch64) — both
+   are built, boot-tested and published on every merge.
 2. Unzip it (any platform's native tools work — macOS Finder,
    Windows Explorer, `unzip` on Linux/BSD):
 
@@ -61,6 +62,23 @@ entirely differently than those original solutions.
      -nic user,model=e1000 \
      -nographic
    ```
+
+   On arm64 the machine is `virt`, the firmware is AAVMF/`QEMU_EFI.fd`,
+   and virtio-net needs its PXE option ROM turned off (`romfile=`)
+   because the arm64 QEMU packages don't ship one:
+
+   ```sh
+   img=$(echo NextBSD-arm64-*.img)
+   qemu-system-aarch64 \
+     -accel kvm -cpu host -m 2048 -machine virt \
+     -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+     -drive file="$img",format=raw,if=virtio \
+     -netdev user,id=net0 -device virtio-net-pci,netdev=net0,romfile= \
+     -nographic
+   ```
+
+   (`-accel kvm -cpu host` only works when the host is the same
+   architecture as the image; drop it for emulation, which is slow.)
 
 4. Wait ~10 seconds. You'll see launchd start its daemons, DHCP fire
    on `em0`, syslog come up, and the `login:` prompt land. Log in
@@ -178,7 +196,7 @@ rolling `continuous` release that the next stage ingests:
   (the FreeBSD source tree is never forked in place).
 - **[nextbsd-freebsd-compat](https://github.com/nextbsd-redux/nextbsd-freebsd-compat)** —
   the curated FreeBSD-source base userland, built from a srclist.
-- **[nextbsd-kernel-modules](https://github.com/nextbsd-redux/nextbsd-kernel-modules)** —
+- **[nextbsd-kernel-extensions](https://github.com/nextbsd/nextbsd-kernel-extensions)** —
   driver kexts (KPI-matched to the kernel).
 - **this repo** — assembles the bootable image/ISO: it lays the from-source
   base, builds the Darwin-source userland and the Mach/launchd stack on top,

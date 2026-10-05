@@ -1,32 +1,22 @@
 #!/bin/sh
-# img-boot-test.sh — LIGHT boot smoke test for the installed disk image.
-# Boots the raw .img in qemu (UEFI via OVMF, virtio disk) and verifies the
-# ASSEMBLED image reaches a usable system: loader -> kernel -> launchd PID 1
-# -> getty login -> root shell on a UFS root.
+# img-boot-test.sh — thin entry point onto the shared nextbsd-ci boot harness
+# (T4). A full image boot is expensive, so this is a LIGHT smoke gate: boot the
+# freshly-built NextBSD-*.img to the getty login prompt, confirm a clean
+# end-state, power off. It is a login-only run (NB_LOGIN_ONLY=1) — no on-image
+# marker suite — because the image gate's job is "did this kernel boot," not
+# "do the userland markers pass" (that is the kernel/userland lanes' job).
 #
-# It deliberately does NOT run the deep functional suite
-# (/usr/tests/freebsd-launchd-mach/run.sh — the LEAF command-suite + launchd /
-# CoreFoundation / launchctl + syslog + network-daemon gates). Those exercise
-# the Darwin userland and belong in nextbsd-userland's ci-image-boot, closest
-# to the source; re-running them here (on the same pkg-built rootfs the ISO
-# shares) was redundant and the syslog/network round-trips race under qemu. The
-# ISO builder only needs to prove the two boot PATHS reach a shell: this
-# direct-UFS disk image and the live ISO (iso-boot-test.sh).
-#
-# Success = "login:" prompt reached (launchd PID 1 got getty up).
-
+# The loader un-mute dance, the arch-aware qemu argv (OVMF/q35/amd64,
+# AAVMF/virt/arm64), login detection and teardown all come from the shared
+# harness now, not the in-repo loader.exp.inc / qemu-arch.sh those deleted.
 set -eu
-
-IMG=${1:?usage: img-boot-test.sh path/to/NextBSD-*.img[.zip]}
+IMG=${1:?usage: [ARCH=amd64|arm64] img-boot-test.sh path/to/NextBSD-*.img[.zip]}
 [ -f "$IMG" ] || { echo "ERROR: $IMG not found"; exit 1; }
 
 mkdir -p tests
-LOG=tests/img-boot.log
-EXP=tests/img-boot.exp
-: > "$LOG"
-
+# A zipped image is extracted to a raw disk.img first (the harness takes a raw IMG).
 case "$IMG" in
-*.zip)
+  *.zip)
     RAW=tests/disk.img
     echo "==> extracting $IMG -> $RAW"
     MEMBER=$(unzip -Z1 "$IMG" | grep -E '\.img$' | head -1)
@@ -36,110 +26,15 @@ case "$IMG" in
     ;;
 esac
 
-echo "==> img boot test: $IMG"
+# Fetch the shared harness at the pinned lockstep tag (absent = first run).
+[ -d nextbsd-ci/.git ] || git clone --depth 1 --branch v0.3.4 \
+  https://github.com/nextbsd/nextbsd-ci.git nextbsd-ci
+
+echo "==> img boot test: $IMG (arch=${ARCH:-amd64}) — shared harness, login-only"
 ls -lh "$IMG"
 
-if [ -e /dev/kvm ]; then
-    sudo chmod 666 /dev/kvm 2>/dev/null || true
-fi
-if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-    ACCEL_FLAGS="-accel kvm -cpu host"
-    echo "==> using KVM acceleration"
-else
-    ACCEL_FLAGS="-accel tcg,thread=single -cpu qemu64"
-    echo "==> using TCG (single-thread)"
-fi
-
-OVMF=""
-for f in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do
-    [ -f "$f" ] && { OVMF="$f"; break; }
-done
-[ -n "$OVMF" ] || { echo "ERROR: no OVMF firmware found"; exit 1; }
-echo "==> using UEFI firmware: $OVMF"
-
-export ACCEL_FLAGS OVMF
-
-cat > "$EXP" <<'EOF'
-set timeout 600
-log_file -a tests/img-boot.log
-log_user 1
-
-set img [lindex $argv 0]
-set accel_flags [split $env(ACCEL_FLAGS) " "]
-
-eval spawn qemu-system-x86_64 \
-    -m 4G \
-    -machine q35 \
-    -bios $env(OVMF) \
-    $accel_flags \
-    -drive file=$img,format=raw,if=virtio \
-    -nic user,model=e1000 \
-    -display none -serial stdio \
-    -no-reboot
-
-# Stage 0: drop into the loader OK prompt and enable the serial console for
-# the kernel (/boot/loader.conf leaves console unset for a clean console on
-# real hardware). Kept minimal — every extra `set` round-trip risks the loader
-# eating serial chars. Match the echoed command before "OK " to avoid racing a
-# stale OK from the prior `set`.
-expect {
-    timeout { puts "\nFAIL: didn't see loader autoboot prompt within 60s"; exit 1 }
-    -re "Hit \\\[Enter\\\]" { send " " }
-    "Booting"                { send " " }
-    "FreeBSD/amd64 EFI"      { send " " }
-}
-expect {
-    timeout { puts "\nFAIL: didn't reach loader OK prompt within 30s"; exit 1 }
-    "OK " { puts "\n==> at loader prompt; setting serial console vars" }
-}
-send "set console=comconsole\r"; expect "set console=comconsole"; expect "OK "
-send "set boot_serial=YES\r";    expect "set boot_serial=YES";    expect "OK "
-send "set comconsole_speed=115200\r"; expect "set comconsole_speed=115200"; expect "OK "
-send "set boot_multicons=YES\r"; expect "set boot_multicons=YES"; expect "OK "
-# boot VERBOSE: the shipped image sets boot_mutemsgs="YES" (nextbsd#363), which
-# mutes kernel console output. RB_VERBOSE (boot -v) bypasses the mute so CI sees
-# full boot output; shipped images (booted normally) stay quiet.
-send "boot -v\r"
-
-# Stage 1: launchd PID 1 comes up and getty reaches a login prompt.
-expect {
-    timeout { puts "\nFAIL: 'login:' prompt not seen within 8 minutes"; exit 1 }
-    -re "panic|Fatal trap" { puts "\nFAIL: kernel panic during boot"; exit 1 }
-    "login:" { puts "\nOK: LOGIN-OK — launchd reached getty on the UFS root" }
-}
-
-# Stage 2: log in as root (passwordless from base) and confirm a shell + a UFS
-# root (direct disk boot, no live union pivot).
-send "root\r"
-expect {
-    timeout { puts "\nFAIL: no response after sending root"; exit 1 }
-    "Password:" { send "\r"; exp_continue }
-    "Login incorrect" { puts "\nFAIL: root login rejected"; exit 1 }
-    -re {[#%$] $} { puts "\nOK: at root shell prompt" }
-}
-send "mount | grep ' / '\r"
-expect {
-    timeout { puts "\nWARN: mount produced no output" }
-    -re "ufs" { puts "\nOK: ROOT-IS-UFS — / is a ufs mount" }
-    -re {[#%$] $} { }
-}
-send "halt -p\r"
-expect { timeout { } eof { } }
-puts "\nIMG-BOOT-DONE"
-EOF
-
-set +e
-expect -f "$EXP" "$IMG"
-rc=$?
-set -e
-
-echo "==> verdict"
-# The OK `puts` lines go to expect's stdout, not the serial transcript ($LOG).
-# Assert against the getty login prompt in the transcript (launchd PID 1 reached
-# getty on the installed image).
-if grep -q "login:" "$LOG"; then
-    echo "PASS: disk image booted — launchd reached the login prompt on a UFS root"
-    exit 0
-fi
-echo "FAIL: disk image did not reach the login prompt (rc=$rc)"
-exit 1
+# Login-only: the harness boots -> logs in -> confirms a clean end-state ->
+# powers off, and runs no on-image suite. NB_BOOT_VERBOSE=1: the serial
+# transcript is the diagnostic. The exit class is the gate.
+ARCH=${ARCH:-amd64} NB_LOGIN_ONLY=1 NB_BOOT_VERBOSE=1 NB_LOG=boot-test.log \
+  sh nextbsd-ci/harness/boot-test.sh "$IMG"
