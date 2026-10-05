@@ -12,13 +12,24 @@ on:
       - '**/*.md'
       - 'LICENSE'
       - 'NOTICE'
-  # Rebuild the ISO when the from-source base it ingests changes. Sent by
-  # nextbsd-freebsd-compat at the end of a successful main base build, which
-  # is itself triggered by the toolchain on a releng/15.0 update. Full chain:
-  # releng/15.0 -> toolchain -> compat -> (base-updated) -> nextbsd.
+  # Rebuild when a COMPONENT the image assembles from publishes a new
+  # `continuous` artifact. The CI image lays the component tarballs straight
+  # in (build.sh ASSEMBLY=artifacts), so the image is only as fresh as the
+  # newest component it ingests:
+  #   base-updated    nextbsd-freebsd-compat (base; itself triggered by the
+  #                    toolchain on a releng/15.0 update)
+  #   kernel-updated  nextbsd-kernel
+  #   kexts-updated   nextbsd-kernel-extensions (graphics-kexts/<arch>)
+  # (userland changes ride on nextbsd's own push/PR events: the userland repo
+  #  has no consumer-trigger of its own and nextbsd rebuilds cover it via the
+  #  schedule below.)
   repository_dispatch:
-    types: [base-updated]
+    types: [base-updated, kernel-updated, kexts-updated]
   workflow_dispatch:
+  # Backstop: even if a dispatch is missed, the CI image rebuilds on a fixed
+  # cadence so no lane is ever booting a stale component.
+  schedule:
+    - cron: '0 */12 * * *'
 
 permissions:
   contents: read
@@ -89,23 +100,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `freebsd` is the vmactions/freebsd-vm release (bare "15.1"). The image
-        # is assembled host-driven (pkg -r install, host pwd_mkdb/cap_mkdb,
-        # arch-agnostic makefs/mkuzip/mkimg) in the x86 FreeBSD 15.1 VM, so an
-        # aarch64 image needs no qemu-user to BUILD.
+        # `freebsd` is the vmactions/freebsd-vm release (bare "15.1"). Both
+        # arches build in the SAME x86 FreeBSD 15.1 VM: the image is assembled
+        # host-driven (pkg -r install, host pwd_mkdb/cap_mkdb, arch-agnostic
+        # makefs/mkuzip/mkimg), so aarch64 needs no qemu-user to BUILD. The two
+        # entries run as independent parallel matrix legs.
         #
-        # arm64 is TEMPORARILY DISABLED: the aarch64 ISO builds+publishes fine
-        # but does not boot, and CI never caught it because the disk `img-test` and
-        # live `iso-test` jobs are amd64-only (they run qemu-system-x86; booting
-        # aarch64 needs qemu-system-aarch64 + AAVMF firmware). Re-added in a
-        # follow-up together with an aarch64 boot test, and only once it boots
-        # green. build.sh keeps its arch-aware paths (ABIARCH, BOOTAA64.EFI,
-        # UEFI-only mkimg) so re-enabling is just restoring the matrix leg.
+        # arm64 was disabled in #360 because the aarch64 ISO built and published
+        # but did not boot, and CI could not see it (both boot jobs were
+        # amd64-only). Both halves are fixed here: build.sh now exports
+        # TARGET=arm64 to mkisoimages.sh — without it the ISO's El Torito ESP got
+        # this amd64 VM's BOOTX64.EFI instead of BOOTAA64.EFI, so no arm64
+        # firmware would boot it — and the img-test/iso-test jobs below have an
+        # arm64 leg on a native-ARM runner.
         include:
           - freebsd: '15.1'
             arch: 'amd64'
+          - freebsd: '15.1'
+            arch: 'arm64'
     steps:
       - uses: actions/checkout@v4
+
+      # The shared image assembly (build.sh ASSEMBLY=artifacts calls
+      # nextbsd-ci/scripts/assemble-image.sh). Pinned to the release tag so the
+      # recipe does not drift with nextbsd-ci main. freebsd-vm rsyncs the whole
+      # workspace, so the checkout lands in the VM where build.sh finds it.
+      - name: checkout shared assembly (nextbsd-ci, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd/nextbsd-ci
+          ref: v0.3.4
+          path: nextbsd-ci
 
       - name: free disk space
         uses: jlumbroso/free-disk-space@main
@@ -152,6 +177,9 @@ jobs:
             export FREEBSD_VERSION=${{ matrix.freebsd }}
             export ARCH=${{ matrix.arch }}
             export IMG_DATE=${{ steps.meta.outputs.date }}
+            # CI images always assemble from the latest component artifacts,
+            # never from pkg (packages are gated release artifacts).
+            export ASSEMBLY=artifacts
             sh build.sh
 
       - name: checksum + summary
@@ -180,6 +208,132 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # The Raspberry Pi 500+ lane. Same rootfs as everything above -- same
+  # packages, same makefs -- and a completely different boot half: MBR instead
+  # of GPT, a FAT32 partition holding config.txt instead of an ESP holding
+  # loader.efi, and no ISO at all, because the BCM2712 bootloader looks for a
+  # FAT partition with a config.txt on it and an ISO 9660 image has neither.
+  #
+  # Deliberately NOT in the build matrix above: that job's steps assume an ISO
+  # exists and name both artifacts, and the two lanes share nothing but
+  # build.sh itself.
+  #
+  # This image cannot be boot tested in CI -- qemu does not emulate a Pi 500+,
+  # and the parts of this board NextBSD is still bringing up (RP1, PCIe, MSI)
+  # are exactly the parts an emulator would fake. It was held back from
+  # `continuous` until it had booted real hardware; that has happened
+  # (nextbsd-kernel#85, closed), so it now publishes like every other lane.
+  #
+  # `release` therefore lists this job in `needs`. That is the whole fix: the
+  # download step already pulls every artifact in the run and the publish glob
+  # already matches NextBSD-arm64-rpi5-*.img.zip, so the image was never
+  # excluded -- `release` simply did not wait for it, and this lane (a second
+  # FreeBSD VM, plus a kernel download) always finished last. The hold-back
+  # was a race that happened to fall the same way every time, not a gate.
+  #
+  # This is still the one published asset no CI boot vouches for. The release
+  # notes say so.
+  build-rpi5:
+    name: build (rpi5 arm64)
+    needs: changes
+    if: needs.changes.outputs.build_needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Shared image assembly (build.sh ASSEMBLY=artifacts) — see the build
+      # job above; rsynced into the VM with the workspace.
+      - name: checkout shared assembly (nextbsd-ci, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd/nextbsd-ci
+          ref: v0.3.4
+          path: nextbsd-ci
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: compute build date
+        id: meta
+        run: echo "date=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      # kernel.bin wrapped in an arm64 Linux Image header, from nextbsd-kernel's
+      # rolling `continuous` release. A public release asset, so plain curl --
+      # no token, no cross-repo artifact API, and no 14-day expiry. Verify the
+      # Image magic (0x644d5241 at offset 56) here as well as in build.sh: a
+      # 404 page saved as an .img is still a file, and this board reports every
+      # kind of wrong kernel as the same silence.
+      - name: fetch the board kernel
+        run: |
+          set -eu
+          URL=https://github.com/nextbsd/nextbsd-kernel/releases/download/continuous/rpi500-kernel8-arm64.img
+          curl -fSL --retry 3 -o kernel8.img "$URL"
+          ls -l kernel8.img
+          MAGIC=$(dd if=kernel8.img bs=1 skip=56 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+          if [ "$MAGIC" != "41524d64" ]; then
+            echo "::error::rpi500-kernel8-arm64.img has no arm64 Image header (magic=$MAGIC)"
+            exit 1
+          fi
+          echo "Image header ok"
+
+      - name: build the rpi5 image inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.1'
+          # Same ceiling and same reason as the build job above; do not raise
+          # it without restructuring libicu's compile cost.
+          mem: 8192
+          cpu: 4
+          usesh: true
+          sync: rsync
+          copyback: true
+          prepare: |
+            pkg install -y bash git rsync zip
+          run: |
+            set -eu
+            export FREEBSD_VERSION=15.1
+            export BOARD=rpi500
+            export KERNEL8=$PWD/kernel8.img
+            export IMG_DATE=${{ steps.meta.outputs.date }}
+            # CI images always assemble from the latest component artifacts,
+            # never from pkg (packages are gated release artifacts).
+            export ASSEMBLY=artifacts
+            sh build.sh
+
+      - name: checksum + summary
+        run: |
+          ls -lh out/
+          IMG="NextBSD-arm64-rpi5-${{ steps.meta.outputs.date }}.img.zip"
+          ( cd out && sha256sum "$IMG" > "$IMG.sha256" )
+          cat "out/$IMG.sha256"
+          {
+            echo "### Raspberry Pi 500+ image"
+            echo
+            echo "\`$IMG\`"
+            echo
+            echo "Not boot tested by CI -- qemu does not emulate this board."
+            echo "Write it to a USB stick or NVMe and boot it to prove it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NextBSD-arm64-rpi5-${{ steps.meta.outputs.date }}
+          path: |
+            out/NextBSD-arm64-rpi5-${{ steps.meta.outputs.date }}.img.zip
+            out/NextBSD-arm64-rpi5-${{ steps.meta.outputs.date }}.img.zip.sha256
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
   img-test:
     name: img-test (${{ matrix.arch }})
     needs: [changes, build]
@@ -201,7 +355,15 @@ jobs:
     # the flaky qemu-serial loader handshake. We still boot-test on pull_request
     # (the gate) and on repository_dispatch (the base-updated cascade has no PR).
     if: "!cancelled() && needs.changes.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') && github.event_name != 'push'"
-    runs-on: ubuntu-latest
+    # Each leg boots on a runner of its OWN arch: amd64 on the x86 runner, arm64
+    # on GitHub's ubuntu-24.04-arm (free for public repos), the same shape
+    # nextbsd-userland's ci-image-boot has used since #355. That keeps the guest
+    # off cross-arch emulation, which is where qemu gets genuinely slow. The x86
+    # runner also has /dev/kvm; the arm64 one does NOT, so its guest runs on
+    # same-arch TCG — measured at ~1m50s per boot job, comparable to the
+    # KVM-accelerated amd64 leg. The shared nextbsd-ci harness (qemu-arch.sh)
+    # picks KVM whenever /dev/kvm shows up, so these legs get faster for free.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -210,6 +372,11 @@ jobs:
           - freebsd: '15.1'
             variant: '15.1-RELEASE'
             arch: 'amd64'
+            runner: 'ubuntu-24.04'
+          - freebsd: '15.1'
+            variant: '15.1-RELEASE'
+            arch: 'arm64'
+            runner: 'ubuntu-24.04-arm'
     steps:
       - uses: actions/checkout@v4
 
@@ -225,7 +392,9 @@ jobs:
         with:
           # Only THIS arch's artifact — the matrix builds both, and a bare glob
           # would otherwise match both arches' images.
-          pattern: NextBSD-${{ matrix.arch }}-*
+          # [0-9]* anchors on the datestamp: NextBSD-arm64-rpi5-... must not
+          # be swallowed by the glob for the generic NextBSD-arm64-... image.
+          pattern: NextBSD-${{ matrix.arch }}-[0-9]*
           path: out/
           merge-multiple: true
 
@@ -237,27 +406,37 @@ jobs:
           mkdir -p out
           gh release download continuous \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern 'NextBSD-${{ matrix.arch }}-*.img.zip' \
+            --pattern 'NextBSD-${{ matrix.arch }}-[0-9]*.img.zip' \
             --dir out/ --clobber
           ls -lh out/
 
+      # qemu-system-arm carries qemu-system-aarch64; qemu-efi-aarch64 supplies
+      # /usr/share/qemu-efi-aarch64/QEMU_EFI.fd (the arm64 counterpart of ovmf).
       - name: install qemu + expect
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            sudo apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 expect
+          else
+            sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf expect
+          fi
 
       - name: boot test
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           chmod +x tests/img-boot-test.sh
-          IMG=$(ls out/NextBSD-${{ matrix.arch }}-*.img.zip)
+          # A bare glob would match the board image too and put two paths
+          # into a scalar. Anchor on the datestamp.
+          IMG=$(ls out/NextBSD-${{ matrix.arch }}-[0-9]*.img.zip)
           ./tests/img-boot-test.sh "$IMG"
 
       - name: dump img boot serial log
         if: always()
         run: |
-          if [ -f tests/img-boot.log ]; then
-            echo "=== img boot serial log (tail) ==="
-            tail -200 tests/img-boot.log || true
+          if [ -f boot-test.log ]; then
+            echo "=== img boot serial log (tail; shared harness transcript) ==="
+            tail -200 boot-test.log || true
             echo "=== end log ==="
           fi
 
@@ -271,29 +450,41 @@ jobs:
     # publishing; it exists as the iteration feedback loop + a regression signal.
     # Skipped on push-to-main (same flaky-serial rationale as the disk `img-test`).
     if: "!cancelled() && needs.build.result == 'success' && needs.changes.outputs.build_needed == 'true' && github.event_name != 'push'"
-    runs-on: ubuntu-latest
+    # Native-arch runners, same rationale as img-test.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: 'amd64'
+            runner: 'ubuntu-24.04'
+          - arch: 'arm64'
+            runner: 'ubuntu-24.04-arm'
     steps:
       - uses: actions/checkout@v4
 
       - name: download built ISO (artifact)
         uses: actions/download-artifact@v4
         with:
-          pattern: NextBSD-${{ matrix.arch }}-*
+          # [0-9]* anchors on the datestamp: NextBSD-arm64-rpi5-... must not
+          # be swallowed by the glob for the generic NextBSD-arm64-... image.
+          pattern: NextBSD-${{ matrix.arch }}-[0-9]*
           path: out/
           merge-multiple: true
 
       - name: install qemu + expect
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            sudo apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 expect
+          else
+            sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf expect
+          fi
 
       - name: iso boot test
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           chmod +x tests/iso-boot-test.sh
           ISO=$(ls out/NextBSD-${{ matrix.arch }}-*.iso.zip)
@@ -302,15 +493,15 @@ jobs:
       - name: dump live ISO serial log
         if: always()
         run: |
-          if [ -f tests/iso-boot.log ]; then
-            echo "=== live ISO serial log (tail 500) ==="
-            tail -500 tests/iso-boot.log || true
+          if [ -f boot-test.log ]; then
+            echo "=== live ISO serial log (tail 500; shared harness transcript) ==="
+            tail -500 boot-test.log || true
             echo "=== end serial log ==="
           fi
 
   release:
-    name: release (${{ matrix.arch }})
-    needs: [build, img-test]
+    name: release
+    needs: [build, build-rpi5, img-test]
     # Publish on main from a push to this repo, an upstream cascade
     # (repository_dispatch: base-updated), or a manual run (workflow_dispatch:
     # a hand-triggered "Run workflow" republishes `continuous`). PRs and other
@@ -323,27 +514,40 @@ jobs:
     # need doesn't auto-skip release. A failed build still blocks publish; a
     # tests-only push (build skipped) yields build.result!='success' -> no
     # republish, which is correct.
-    if: ${{ always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch') && needs.build.result == 'success' && (needs['img-test'].result == 'success' || needs['img-test'].result == 'skipped') }}
+    #
+    # build-rpi5 is required to succeed for the same reason `build` is: it is a
+    # build, not a boot test, so a failure there is a real failure and not the
+    # emulator flaking. It carries the same `build_needed` guard as `build`, so
+    # it skips exactly when `build` skips -- and that case is already a
+    # no-republish via build.result.
+    if: ${{ always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch') && needs.build.result == 'success' && needs['build-rpi5'].result == 'success' && (needs['img-test'].result == 'success' || needs['img-test'].result == 'skipped') }}
+    #
+    # Deliberately NOT a matrix: one job publishes EVERY arch's artifacts in a
+    # single `continuous` release. A per-arch matrix would run the delete-then-
+    # publish sequence once per cell, and the second cell's delete would drop the
+    # first cell's freshly-uploaded assets (the race the old comment here
+    # predicted for exactly this moment — the arm64 leg landing).
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - freebsd: '15.1'
-            variant: '15.1-RELEASE'
-            arch: 'amd64'
     steps:
       - uses: actions/checkout@v4
 
-      # Pull the dated diskimg artifact as-built — its NextBSD-<arch>-<date>.img.zip
-      # is already the final published name, so there is nothing to rename
-      # or recompute here; publish it straight to `continuous`.
+      # Pull EVERY arch's dated artifact (no `pattern`) — each
+      # NextBSD-<arch>-<date>.img.zip is already the final published name, so
+      # there is nothing to rename or recompute here; publish them straight to
+      # `continuous`.
       - uses: actions/download-artifact@v4
         with:
           path: out/
           merge-multiple: true
+
+      # No hold-back step here any more. The release job cannot run on a pull
+      # request -- its guard requires refs/heads/main plus a push/dispatch
+      # event -- so a PR builds a downloadable artifact and publishes nothing.
+      # Merging is therefore the deliberate act of publishing, which is a
+      # clearer contract than deleting files on the way past, and easier to get
+      # right than remembering to re-enable a deletion.
 
       - name: list release assets
         run: ls -lh out/NextBSD-*.img.zip out/NextBSD-*.img.zip.sha256 out/NextBSD-*.iso.zip out/NextBSD-*.iso.zip.sha256
@@ -351,12 +555,8 @@ jobs:
       # `gh release create` wedges silently on big ISO uploads (single PUT,
       # no chunking, no retry). softprops/action-gh-release uses Octokit's
       # chunked upload with retries -- canonical path for big release assets.
-      # Delete previous continuous release first so old assets don't pile up.
-      #
-      # NOTE: when matrix grows to multiple cells (e.g. adding aarch64 or a
-      # zlib variant), this delete will race across cells. At that point
-      # refactor to a single non-matrix release job that downloads all
-      # artifacts and publishes them together.
+      # Delete previous continuous release first so old assets don't pile up
+      # (safe here: this job is a single cell, so nothing else is uploading).
       - name: delete previous continuous release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -372,6 +572,11 @@ jobs:
           body: |
             Rolling continuous build. Refreshed automatically every push to
             `main` after the build + boot smoke-test both pass.
+
+            `NextBSD-arm64-rpi5-*` (Raspberry Pi 5 family: 5 B, 500/500+, CM5)
+            is built from the same rootfs but is **not** boot tested by CI --
+            qemu does not emulate this board. Write it to a USB stick or NVMe
+            and boot it.
 
             Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             Commit: ${{ github.sha }}
